@@ -50,8 +50,7 @@ transição, ou para sozinho.
 Riscos
 ```
 
-```
-Automação viola os termos de uso da King. Há risco de banimento de conta,
+```Automação viola os termos de uso da King. Há risco de banimento de conta,
 principalmente com ações em intervalos regulares. Fato: os termos proíbem
 automação; a frequência de banimento eu não sei estimar.
 Evite ler memória ou interceptar tráfego do app. É mais complexo, mais arriscado

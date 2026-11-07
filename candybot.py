@@ -6,9 +6,12 @@ Subcomandos:
   show        ler o tabuleiro, imprimir a matriz e salvar debug.png
   seed        selecionar a área do jogo e rotular em lote um tabuleiro só com doces normais
   collect     (passivo) salvar recortes de células não reconhecidas enquanto você joga
-  label       rotular os recortes por tecla
+  label       rotular os recortes por tecla, um a um
+  verify      auditar o dataset rotulado: aponta recortes suspeitos e gera uma imagem-resumo por classe
+  cluster     rotular recortes por GRUPOS de aparência parecida (bem mais rápido que label)
   train       treinar o classificador (model.npz) e mostrar acerto por classe
   kinds       ler o tabuleiro e imprimir o tipo de cada célula
+  plan        ler o tabuleiro e listar as melhores jogadas com pontuação (não move o mouse)
   run         executar o bot (ESC para parar; mouse no canto superior esquerdo aborta)
 """
 import argparse
@@ -24,6 +27,8 @@ import keyboard
 import mss
 import numpy as np
 import pyautogui
+
+import engine
 
 try:
     ctypes.windll.user32.SetProcessDPIAware()
@@ -101,38 +106,31 @@ def read_board(cfg, img=None):
 
 
 # ---------- lógica ----------
-def find_matches(g):
-    n, m = len(g), len(g[0])
-    hit = set()
-    for i in range(n):
-        for j in range(m):
-            c = g[i][j]
-            if c < 0:
-                continue
-            if j + 2 < m and g[i][j + 1] == c and g[i][j + 2] == c:
-                hit |= {(i, j), (i, j + 1), (i, j + 2)}
-            if i + 2 < n and g[i + 1][j] == c and g[i + 2][j] == c:
-                hit |= {(i, j), (i + 1, j), (i + 2, j)}
-    return hit
+# A busca de jogadas vive em engine.py (puro, testável sem GUI).
+def read_cells(cfg, img, use_kinds=False, model=None):
+    """Lê o tabuleiro como matriz de células do engine.
+    Sem --kinds: só cor (paleta), tudo vira doce normal. Com --kinds: usa o classificador."""
+    rows, cols = cfg["rows"], cfg["cols"]
+    if use_kinds and model is not None:
+        crops = [cell_img(img, rows, cols, r, c) for r in range(rows) for c in range(cols)]
+        labs = predict(model, crops)
+        g = [[engine.parse_label(labs[r * cols + c]) for c in range(cols)] for r in range(rows)]
+        return g
+    ids, _ = read_board(cfg, img)
+    return engine.from_color_ids(ids)
 
 
-def best_move(g):
-    n, m = len(g), len(g[0])
-    best, best_score = [], 0
-    for i in range(n):
-        for j in range(m):
-            for di, dj in ((0, 1), (1, 0)):
-                a, b = i + di, j + dj
-                if a >= n or b >= m or g[i][j] < 0 or g[a][b] < 0:
-                    continue
-                g[i][j], g[a][b] = g[a][b], g[i][j]
-                s = len(find_matches(g))
-                g[i][j], g[a][b] = g[a][b], g[i][j]
-                if s > best_score:
-                    best, best_score = [((i, j), (a, b))], s
-                elif s == best_score and s > 0:
-                    best.append(((i, j), (a, b)))
-    return random.choice(best) if best else None
+def weights_from(args):
+    gc = getattr(args, "goal_color", None)
+    return engine.with_goal(gc, getattr(args, "goal_mult", None)) if gc else engine.WEIGHTS
+
+
+def count_unknown(g):
+    return sum(c[1] == engine.U for row in g for c in row)
+
+
+def fmt_cells(g):
+    return "\n".join(" ".join(f"{(c[0] or '-')[:3]:>3}:{c[1]:<2}" for c in row) for row in g)
 
 
 # ---------- ação ----------
@@ -233,19 +231,54 @@ def _stop():
     STOP = True
 
 
+def cmd_plan(args):
+    """Lê o tabuleiro e mostra as melhores jogadas com pontuação. Não move o mouse."""
+    cfg = load_cfg()
+    model = load_model() if args.kinds else None
+    if args.kinds and model is None:
+        sys.exit("Sem model.npz. Rode: python candybot.py train")
+    if not args.kinds and not cfg["palette"]:
+        sys.exit("Paleta vazia. Rode: python candybot.py learn --k N")
+    countdown(args.delay)
+    g = read_cells(cfg, wait_stable(cfg["board"]), args.kinds, model)
+    print(fmt_cells(g))
+    print(f"{count_unknown(g)} desconhecidas de {cfg['rows'] * cfg['cols']}")
+    w = weights_from(args)
+    if w["goal_color"] and not any(c[0] == w["goal_color"] for row in g for c in row):
+        cores = sorted({c[0] for row in g for c in row if c[0]})
+        print(f"AVISO: cor-alvo '{w['goal_color']}' não existe no tabuleiro lido. Cores lidas: {cores}. "
+              "Com --kinds use nomes (azul, verde...); sem --kinds, o índice da paleta.")
+    ranked = engine.rank_moves(g, w)
+    if not ranked:
+        print("Nenhuma jogada válida encontrada.")
+    for sc, a, b in ranked[:args.top]:
+        extra = ""
+        if w["goal_color"]:
+            info = {}
+            engine.simulate(g, a, b, w, info)
+            extra = f"   {w['goal_color']} previstos: {info.get('goal', 0)}"
+        print(f"{sc:6.2f}  {a} -> {b}{extra}")
+    print("Confira a jogada 1 na tela antes de usar run.")
+
+
 def cmd_run(args):
     cfg = load_cfg()
-    if not cfg["palette"]:
+    model = load_model() if args.kinds else None
+    if args.kinds and model is None:
+        sys.exit("Sem model.npz. Rode: python candybot.py train")
+    if not args.kinds and not cfg["palette"]:
         sys.exit("Paleta vazia. Rode: python candybot.py learn --k N")
     keyboard.add_hotkey("esc", _stop)
     print("Iniciando em 3 s. Deixe o jogo visível e em primeiro plano. ESC para parar.")
     time.sleep(3)
 
+    w = weights_from(args)
+    total = cfg["rows"] * cfg["cols"]
     moves = no_move = no_change = 0
     while not STOP and moves < args.max_moves:
         img = wait_stable(cfg["board"])
-        g, _ = read_board(cfg, img)
-        mv = best_move(g)
+        g = read_cells(cfg, img, args.kinds, model)
+        mv = engine.best_move(g, w) if count_unknown(g) <= total * args.max_unknown else None
         if mv is None:
             no_move += 1
             if no_move >= 3:
@@ -254,10 +287,15 @@ def cmd_run(args):
             time.sleep(1.0)
             continue
         no_move = 0
+        goal_txt = ""
+        if w["goal_color"]:
+            info = {}
+            engine.simulate(g, *mv, w, info)
+            goal_txt = f" ({w['goal_color']} previstos: {info.get('goal', 0)})"
         time.sleep(random.uniform(0.3, 0.9))
         swap(cfg, *mv)
         moves += 1
-        after, _ = read_board(cfg, wait_stable(cfg["board"]))
+        after = read_cells(cfg, wait_stable(cfg["board"]), args.kinds, model)
         if after == g:
             no_change += 1
             print(f"Jogada {moves}: tabuleiro não mudou ({no_change}/5).")
@@ -266,7 +304,7 @@ def cmd_run(args):
                 break
         else:
             no_change = 0
-            print(f"Jogada {moves}: {mv[0]} -> {mv[1]}")
+            print(f"Jogada {moves}: {mv[0]} -> {mv[1]}{goal_txt}")
     print(f"Fim. {moves} jogadas.")
 
 
@@ -306,8 +344,9 @@ def load_model():
     return {"X": z["X"], "y": z["y"], "thr": float(z["thr"])}
 
 
-def predict(model, crops, k=3):
-    """k-NN ponderado. Retorna '?' se o vizinho mais próximo estiver longe demais."""
+def predict(model, crops, k=1):
+    """k-NN ponderado. Retorna '?' se o vizinho mais próximo estiver longe demais.
+    k=1 por padrão: classes raras (especiais com poucas amostras) perdem a votação para as normais com k>1."""
     D = pdist(np.array([feat(c) for c in crops]), model["X"])
     out = []
     for d in D:
@@ -404,29 +443,47 @@ def cmd_collect(args):
     (DATA / "unlabeled").mkdir(parents=True, exist_ok=True)
     keyboard.add_hotkey("esc", _stop)
     countdown(args.delay)
-    t0, saved, keep = time.time(), 0, []
+    t0, saved, keep, n = time.time(), 0, [], 0
     keep_sig = set()
-    while not STOP and time.time() - t0 < args.seconds:
-        img = wait_stable(cfg["board"], min_wait=0.3, timeout=4.0)
-        crops = [cell_img(img, rows, cols, r, c) for r in range(rows) for c in range(cols)]
-        labs = predict(model, crops) if model else ["?"] * len(crops)
-        for crop, lab in zip(crops, labs):
-            if not args.all_cells and lab != "?":
+    print(f"Coletando por {args.seconds} s. ESC ou Ctrl+C para parar; o que já foi salvo fica em {DATA / 'unlabeled'}.")
+    try:
+        while not STOP and time.time() - t0 < args.seconds:
+            ti = time.monotonic()
+            img = wait_stable(cfg["board"], min_wait=0.3, timeout=4.0)
+            if time.monotonic() - ti >= 4.0:  # estourou o timeout: tela ainda animando, recorte sairia borrado
+                n += 1
+                print(f"captura {n}: tela instável (animação), ignorada")
+                time.sleep(args.interval)
                 continue
-            # Assinatura visual curta para descartar duplicatas quase idênticas rapidamente.
-            sig = cv2.resize(crop, (8, 8), interpolation=cv2.INTER_AREA)
-            sig = (sig.astype(np.uint8) // 16).tobytes()
-            if sig in keep_sig:
-                continue
-            f = feat(crop)
-            if any(np.linalg.norm(f - o) < args.dedupe for o in keep):
-                continue
-            keep.append(f)
-            keep_sig.add(sig)
-            _save(crop, "unlabeled", "c")
-            saved += 1
-        time.sleep(args.interval)
+            crops = [cell_img(img, rows, cols, r, c) for r in range(rows) for c in range(cols)]
+            labs = predict(model, crops) if model else ["?"] * len(crops)
+            before = saved
+            for crop, lab in zip(crops, labs):
+                if not args.all_cells and lab != "?":
+                    continue
+                # Assinatura visual curta para descartar duplicatas quase idênticas rapidamente.
+                sig = cv2.resize(crop, (8, 8), interpolation=cv2.INTER_AREA)
+                sig = (sig.astype(np.uint8) // 16).tobytes()
+                if sig in keep_sig:
+                    continue
+                f = feat(crop)
+                if any(np.linalg.norm(f - o) < args.dedupe for o in keep):
+                    continue
+                keep.append(f)
+                keep_sig.add(sig)
+                _save(crop, "unlabeled", "c")
+                saved += 1
+            n += 1
+            # time.monotonic: diagnóstico. ~5 s por captura = tela nunca estabiliza (animações do jogo).
+            print(f"captura {n}: +{saved - before} novos (total {saved}), "
+                  f"{labs.count('?')} '?' de {len(labs)}, {time.monotonic() - ti:.1f} s")
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("Interrompido.")
     print(f"{saved} recortes novos em {DATA / 'unlabeled'}. Próximo: python candybot.py label")
+    if n and saved <= 2 and not args.all_cells:
+        print("Quase nada salvo. Se há especiais no tabuleiro, o modelo os está lendo como doces normais "
+              "(limite de desconhecido alto demais). Use: collect --seconds 10 --all-cells --dedupe 7")
 
 
 def cmd_label(_):
@@ -455,10 +512,212 @@ def cmd_label(_):
     cv2.destroyAllWindows()
 
 
+def cluster_feats(F, dist):
+    """Agrupamento guloso por líder: cada vetor entra no grupo do líder mais próximo se estiver a menos
+    de dist; senão vira líder. Retorna listas de índices (líder primeiro)."""
+    groups, leaders = [], []
+    for i, f in enumerate(F):
+        if leaders:
+            d = np.linalg.norm(np.array(leaders) - f, axis=1)
+            j = int(d.argmin())
+            if d[j] < dist:
+                groups[j].append(i)
+                continue
+        leaders.append(f)
+        groups.append([i])
+    return groups
+
+
+def pick_spread(F, idxs, keep):
+    """Escolhe até keep índices bem espalhados no grupo (o primeiro, depois o mais distante dos já escolhidos)."""
+    chosen = [idxs[0]]
+    while len(chosen) < min(keep, len(idxs)):
+        rest = [i for i in idxs if i not in chosen]
+        far = max(rest, key=lambda i: min(np.linalg.norm(F[i] - F[c]) for c in chosen))
+        chosen.append(far)
+    return chosen
+
+
+def cmd_cluster(args):
+    """Rotula por grupos. Cada grupo mostra até 8 exemplos; a tecla vale para o grupo todo.
+    Guarda no máximo --keep amostras por grupo (as mais variadas); o resto vai para dataset/descartados."""
+    files = sorted((DATA / "unlabeled").glob("*.png"))
+    imgs = [(p, cv2.imread(str(p))) for p in files]
+    imgs = [(p, im) for p, im in imgs if im is not None]
+    if not imgs:
+        sys.exit("Nada em dataset/unlabeled. Rode collect.")
+    F = np.array([feat(im) for _, im in imgs], np.float32)
+    groups = sorted(cluster_feats(F, args.dist), key=len, reverse=True)
+    print(f"{len(imgs)} recortes em {len(groups)} grupos (dist {args.dist}). Se um grupo mostrar tipos misturados, "
+          "tecle s e rode de novo com --dist menor.")
+    tipos = ["tipo: " + " ".join(f"{k}={v}" for k, v in TYPES.items()),
+             "sem cor: " + " ".join(f"{k}={v}" for k, v in NOCOLOR.items()) + "  s=pular  d=descartar grupo  q=sair",
+             "listrado: v = listras verticais na imagem; h = horizontais"]
+    (DATA / "descartados").mkdir(parents=True, exist_ok=True)
+
+    def move(idx_list, label):
+        d = DATA / label
+        d.mkdir(parents=True, exist_ok=True)
+        for i in idx_list:
+            imgs[i][0].rename(d / imgs[i][0].name)
+
+    for gi, idxs in enumerate(groups, 1):
+        show = pick_spread(F, idxs, 8)
+        head = [f"grupo {gi}/{len(groups)}: {len(idxs)} recortes. TODOS os exemplos tem o mesmo tipo e cor?"]
+        k = ask(montage([imgs[i][1] for i in show]), head + tipos, set(TYPES) | set(NOCOLOR) | {"s", "q", "d"}, scale=1)
+        if k == "q":
+            break
+        if k == "s":
+            continue
+        if k == "d":
+            move(idxs, "descartados")
+            continue
+        if k in NOCOLOR:
+            lab = NOCOLOR[k]
+        else:
+            k2 = ask(montage([imgs[i][1] for i in show]),
+                     ["cor: " + " ".join(f"{a}={b}" for a, b in COLORS.items()) + "  s=pular grupo"],
+                     set(COLORS) | {"s"}, scale=1)
+            if k2 == "s":
+                continue
+            lab = f"{TYPES[k]}_{COLORS[k2]}"
+        kept = pick_spread(F, idxs, args.keep)
+        move(kept, lab)
+        move([i for i in idxs if i not in kept], "descartados")
+        print(f"grupo {gi}: {len(kept)} amostras -> {lab} ({len(idxs) - len(kept)} repetidas descartadas)")
+    cv2.destroyAllWindows()
+
+
+def hue_sat(crop):
+    """Matiz (0-360) e saturação (0-255) da cor média do centro do recorte."""
+    h, w = crop.shape[:2]
+    c = crop[int(h * .25):int(h * .75), int(w * .25):int(w * .75)]
+    m = c.reshape(-1, 3).mean(axis=0).astype(np.uint8).reshape(1, 1, 3)
+    hsv = cv2.cvtColor(m, cv2.COLOR_BGR2HSV)[0, 0]
+    return float(hsv[0]) * 2.0, float(hsv[1])
+
+
+def hue_dist(a, b):
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
+
+
+def circ_mean(hues):
+    ang = np.deg2rad(hues)
+    return float(np.rad2deg(np.arctan2(np.sin(ang).mean(), np.cos(ang).mean())) % 360.0)
+
+
+def audit_dataset(hue_tol=20.0):
+    """Procura recortes rotulados de forma suspeita. Retorna (items, flags, class_hue).
+    items = [(caminho, classe, imagem)], flags = {indice: [motivos]}.
+    Heurísticas, não prova: (1) vizinho mais próximo é de outra classe; (2) longe do padrão da própria classe;
+    (3) para normal_*, matiz da cor diferente do resto da classe."""
+    items = []
+    for d in sorted(DATA.glob("*")):
+        if d.is_dir() and d.name not in ("unlabeled", "descartados"):
+            for p in sorted(d.glob("*.png")):
+                im = cv2.imread(str(p))
+                if im is not None:
+                    items.append((p, d.name, im))
+    if len(items) < 2:
+        return items, {i: [] for i in range(len(items))}, {}
+    F = np.array([feat(im) for _, _, im in items], np.float32)
+    y = np.array([lab for _, lab, _ in items])
+    D = pdist(F, F)
+    np.fill_diagonal(D, np.inf)
+    nn = D.argmin(axis=1)
+    flags = {i: [] for i in range(len(items))}
+    class_hue = {}
+    for i in range(len(items)):
+        if y[nn[i]] != y[i] and (y == y[i]).sum() >= 2:
+            flags[i].append(f"vizinho mais próximo é {y[nn[i]]}")
+    for lab in sorted(set(y)):
+        idx = np.where(y == lab)[0]
+        if len(idx) >= 5:
+            sub = F[idx]
+            Dc = pdist(sub, sub)
+            med = Dc.sum(axis=1).argmin()
+            d = Dc[med]
+            m = float(np.median(d))
+            mad = 1.4826 * float(np.median(np.abs(d - m)))
+            lim = max(m + 4 * mad, 1.6 * m)
+            for j, i in enumerate(idx):
+                if d[j] > lim:
+                    flags[i].append(f"fora do padrão da classe (dist {d[j]:.1f} > {lim:.1f})")
+        if lab.startswith("normal_") and len(idx) >= 3:
+            hs = [(i, *hue_sat(items[i][2])) for i in idx]
+            hs = [(i, h) for i, h, sat in hs if sat >= 40]
+            if len(hs) >= 3:
+                ref = circ_mean(np.array([h for _, h in hs]))
+                near = [h for _, h in hs if hue_dist(h, ref) < 60]
+                ref = circ_mean(np.array(near)) if near else ref
+                class_hue[lab] = ref
+                for i, h in hs:
+                    if hue_dist(h, ref) > hue_tol:
+                        flags[i].append(f"matiz {h:.0f} graus, a classe está em {ref:.0f}")
+    return items, flags, class_hue
+
+
+def class_sheet(items, idxs, flags, cols=10, size=64):
+    rows = (len(idxs) + cols - 1) // cols
+    sheet = np.zeros((rows * size, cols * size, 3), np.uint8)
+    for k, i in enumerate(idxs):
+        r, c = divmod(k, cols)
+        tile = cv2.resize(items[i][2], (size, size))
+        if flags[i]:
+            cv2.rectangle(tile, (0, 0), (size - 1, size - 1), (0, 0, 255), 3)
+        cv2.putText(tile, str(k + 1), (3, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        sheet[r * size:(r + 1) * size, c * size:(c + 1) * size] = tile
+    return sheet
+
+
+def cmd_verify(args):
+    items, flags, class_hue = audit_dataset(args.hue_tol)
+    if not items:
+        sys.exit("Dataset vazio. Rode seed/cluster/label antes.")
+    out = Path("verificacao")
+    out.mkdir(exist_ok=True)
+    total = 0
+    moved = []
+    for lab in sorted({l for _, l, _ in items}):
+        if not lab.startswith(args.only):
+            continue
+        idxs = [i for i, (_, l, _) in enumerate(items) if l == lab]
+        bad = [i for i in idxs if flags[i]]
+        total += len(bad)
+        sheet = class_sheet(items, idxs, flags, args.cols)
+        cv2.imwrite(str(out / f"{lab}.png"), sheet)
+        aviso = "  <- poucas amostras (<5), checagem limitada" if len(idxs) < 5 else ""
+        print(f"{lab:28s} n={len(idxs):3d}  suspeitas={len(bad)}{aviso}")
+        for i in bad:
+            print(f"    #{idxs.index(i) + 1:<3d} {items[i][0].name}: " + "; ".join(flags[i]))
+        if args.show:
+            cv2.imshow(lab + " (vermelho = suspeita; tecle algo)", sheet)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
+        if args.move:
+            for i in bad:
+                items[i][0].rename(DATA / "unlabeled" / items[i][0].name)
+                moved.append(items[i][0].name)
+    if class_hue:
+        print("Matiz médio por classe normal (graus; confira se os nomes fazem sentido):")
+        for lab, h in sorted(class_hue.items(), key=lambda t: t[1]):
+            print(f"    {lab:20s} {h:5.0f}")
+        labs = sorted(class_hue, key=class_hue.get)
+        for a_, b_ in zip(labs, labs[1:]):
+            if hue_dist(class_hue[a_], class_hue[b_]) < args.hue_tol:
+                print(f"AVISO: {a_} e {b_} têm matiz parecido; pode haver cor rotulada com o nome errado.")
+    print(f"{total} suspeitas. Imagens em {out}/ (borda vermelha = suspeita; número = # impresso acima).")
+    if args.move:
+        print(f"{len(moved)} recortes movidos para dataset/unlabeled. Reclassifique: python candybot.py cluster --dist 3")
+    elif total:
+        print("Para devolver as suspeitas ao unlabeled: python candybot.py verify --move")
+
+
 def cmd_train(_):
     X, y = [], []
     for d in sorted(DATA.glob("*")):
-        if d.is_dir() and d.name != "unlabeled":
+        if d.is_dir() and d.name not in ("unlabeled", "descartados"):
             for p in d.glob("*.png"):
                 im = cv2.imread(str(p))
                 if im is not None:
@@ -519,19 +778,44 @@ def main():
     pc = sub.add_parser("collect")
     pc.add_argument("--seconds", type=int, default=120, help="duração da coleta")
     pc.add_argument("--interval", type=float, default=1.0, help="pausa entre capturas")
-    pc.add_argument("--dedupe", type=float, default=2.0, help="distância mínima entre recortes salvos")
+    pc.add_argument("--dedupe", type=float, default=7.0, help="distância mínima entre recortes salvos")
     pc.add_argument("--delay", type=int, default=3)
     pc.add_argument("--all-cells", action="store_true",
                     help="salva todas as células (não só '?'), com deduplicação")
     pc.set_defaults(fn=cmd_collect)
     sub.add_parser("label").set_defaults(fn=cmd_label)
+    pv = sub.add_parser("verify")
+    pv.add_argument("--only", default="normal_", help="prefixo das classes a reportar ('' = todas)")
+    pv.add_argument("--hue-tol", type=float, default=20.0, help="tolerância de matiz em graus (classes normal_*)")
+    pv.add_argument("--cols", type=int, default=10, help="colunas da imagem-resumo")
+    pv.add_argument("--show", action="store_true", help="abre cada imagem-resumo numa janela")
+    pv.add_argument("--move", action="store_true", help="move as suspeitas de volta para dataset/unlabeled")
+    pv.set_defaults(fn=cmd_verify)
+    pcl = sub.add_parser("cluster")
+    pcl.add_argument("--dist", type=float, default=6.0, help="distância máxima para agrupar (menor = grupos mais puros)")
+    pcl.add_argument("--keep", type=int, default=5, help="amostras guardadas por grupo")
+    pcl.set_defaults(fn=cmd_cluster)
     sub.add_parser("train").set_defaults(fn=cmd_train)
     pk = sub.add_parser("kinds")
     pk.add_argument("--delay", type=int, default=3)
     pk.set_defaults(fn=cmd_kinds)
     pr = sub.add_parser("run")
     pr.add_argument("--max-moves", type=int, default=100)
+    pr.add_argument("--kinds", action="store_true",
+                    help="usa o classificador (model.npz) para ler doces especiais; padrão: só cor")
+    pr.add_argument("--max-unknown", type=float, default=0.3,
+                    help="fração máxima de células desconhecidas; acima disso não joga (pop-up/leitura ruim)")
+    pr.add_argument("--goal-color", default=None,
+                    help="cor do objetivo (com --kinds: azul, verde, laranja, roxo...; sem: índice da paleta)")
+    pr.add_argument("--goal-mult", type=float, default=None, help="peso dos doces da cor-alvo (padrão 4)")
     pr.set_defaults(fn=cmd_run)
+    pp = sub.add_parser("plan")
+    pp.add_argument("--kinds", action="store_true")
+    pp.add_argument("--top", type=int, default=5)
+    pp.add_argument("--goal-color", default=None)
+    pp.add_argument("--goal-mult", type=float, default=None)
+    pp.add_argument("--delay", type=int, default=3)
+    pp.set_defaults(fn=cmd_plan)
     args = p.parse_args()
     args.fn(args)
 
